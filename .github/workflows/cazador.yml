@@ -1,0 +1,148 @@
+name: Cazador relevo Oracle
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: cazador
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  cazar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+      NOMBRE: relay-bogota
+      SUBRED: public subnet-relay-vcn
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar OCI CLI
+        run: |
+          pipx install oci-cli >/dev/null 2>&1
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Credenciales de Oracle
+        env:
+          OCI_USER: ${{ secrets.OCI_USER }}
+          OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+        run: |
+          for v in OCI_USER OCI_TENANCY OCI_FINGERPRINT OCI_KEY; do
+            [ -n "${!v}" ] || { echo "Falta el secreto $v"; exit 1; }
+          done
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_KEY" | tr -d '\r' | sed -n '/-----BEGIN/,/-----END/p' > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+          {
+            echo "[DEFAULT]"
+            echo "user=$(printf '%s' "$OCI_USER" | tr -d '[:space:]')"
+            echo "fingerprint=$(printf '%s' "$OCI_FINGERPRINT" | tr -d '[:space:]')"
+            echo "tenancy=$(printf '%s' "$OCI_TENANCY" | tr -d '[:space:]')"
+            echo "region=sa-bogota-1"
+            echo "key_file=$HOME/.oci/key.pem"
+          } > ~/.oci/config
+          chmod 600 ~/.oci/config
+
+      - name: Cazar o cuidar la VM
+        env:
+          C_RAW: ${{ secrets.OCI_TENANCY }}
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+          SSH_PUBKEY: ${{ secrets.SSH_PUBKEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          C=$(printf '%s' "$C_RAW" | tr -d '[:space:]')
+
+          # 1) Si la VM ya existe, solo la cuida (la enciende si Oracle la apago).
+          if ! L=$(oci compute instance list -c "$C" --display-name "$NOMBRE" --all 2>/tmp/oci_err); then
+            echo "No pude consultar Oracle:"
+            { cat /tmp/oci_err; printf '%s\n' "$L"; } | grep -E '"code"|"message"' \
+              || { cat /tmp/oci_err; printf '%s\n' "$L"; } | tail -3
+            exit 1
+          fi
+          EST=""
+          if [ -n "$L" ]; then
+            EST=$(printf '%s' "$L" | jq -r '[.data[]? | select(."lifecycle-state" != "TERMINATED")][0]."lifecycle-state" // empty') \
+              || { echo "Oracle respondio algo inesperado; no intento crear nada."; exit 1; }
+          fi
+          if [ -n "$EST" ]; then
+            echo "La VM ya existe (estado: $EST)."
+            if [ "$EST" = "STOPPED" ]; then
+              ID=$(printf '%s' "$L" | jq -r '[.data[] | select(."lifecycle-state" == "STOPPED")][0].id')
+              oci compute instance action --instance-id "$ID" --action START >/dev/null && echo "Estaba apagada: la encendi."
+            fi
+            exit 0
+          fi
+          [ -n "$TS_AUTHKEY" ] || { echo "Falta el secreto TS_AUTHKEY"; exit 1; }
+
+          # 2) Datos para crearla.
+          AD=$(oci iam availability-domain list -c "$C" --query 'data[0].name' --raw-output)
+          SUB=$(oci network subnet list -c "$C" --display-name "$SUBRED" --query 'data[0].id' --raw-output)
+          IMG=$(oci compute image list -c "$C" --all --operating-system "Canonical Ubuntu" --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC --query 'data[?contains("display-name",`"24.04"`) && !contains("display-name",`"Minimal"`)] | [0].id' --raw-output)
+          for v in AD SUB IMG; do
+            if [ -z "${!v}" ] || [ "${!v}" = "null" ]; then echo "No encontre $v"; exit 1; fi
+          done
+
+          # 3) Lo que la VM hace sola al primer arranque: abrir el puerto, instalar Tailscale y ser relevo.
+          cat > /tmp/init.sh <<EOF
+          #!/bin/bash
+          iptables -I INPUT -p udp --dport 40000 -j ACCEPT
+          netfilter-persistent save || true
+          for i in 1 2 3 4 5 6; do curl -fsSL https://tailscale.com/install.sh | sh && break; sleep 30; done
+          for i in 1 2 3 4 5 6; do tailscale up --auth-key=$TS_AUTHKEY --hostname=relay-bogota --accept-dns=false --ssh && break; sleep 20; done
+          tailscale set --relay-server-port=40000
+          EOF
+
+          EXTRA=()
+          if [ -n "$SSH_PUBKEY" ]; then
+            printf '%s\n' "$SSH_PUBKEY" | tr -d '\r' > /tmp/ssh.pub
+            EXTRA=(--ssh-authorized-keys-file /tmp/ssh.pub)
+          fi
+
+          # 4) Intentos cada 60 s durante ~3 minutos (el flujo se repite cada 5 minutos).
+          FIN=$(( $(date +%s) + 180 ))
+          n=0
+          while :; do
+            n=$((n+1))
+            R=$(oci --no-retry compute instance launch -c "$C" --availability-domain "$AD" \
+                --shape VM.Standard.A1.Flex --shape-config '{"ocpus":1,"memoryInGBs":1}' \
+                --image-id "$IMG" --subnet-id "$SUB" --assign-public-ip true \
+                --display-name "$NOMBRE" --hostname-label relay-bogota \
+                --user-data-file /tmp/init.sh "${EXTRA[@]}" 2>&1) || true
+            if printf '%s' "$R" | grep -q '"lifecycle-state"'; then
+              echo "VM creada en el intento $n."
+              gh issue create --title "VM relay-bogota creada" \
+                --body "El cazador consiguio la VM en Oracle Bogota. En unos minutos aparece sola en Tailscale como relay-bogota." >/dev/null || true
+              exit 0
+            elif printf '%s' "$R" | grep -qiE 'capacity|TooManyRequests|InternalError|timed out|timeout|Connection|ServiceUnavailable|Bad Gateway'; then
+              echo "Intento $n: sin cupo."
+            else
+              echo "Error inesperado:"
+              printf '%s\n' "$R" | grep -E '"code"|"message"' || printf '%s\n' "$R" | tail -3
+              exit 1
+            fi
+            [ "$(date +%s)" -ge "$FIN" ] && break
+            sleep 60
+          done
+
+      - name: Mantener activo el repositorio
+        if: always()
+        continue-on-error: true
+        run: |
+          dias=$(( ( $(date +%s) - $(git log -1 --format=%ct) ) / 86400 ))
+          if [ "$dias" -ge 45 ]; then
+            date -u +%F > .keepalive
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .keepalive
+            git commit -q -m "keepalive"
+            git push -q
+          fi
