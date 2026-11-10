@@ -1,32 +1,135 @@
 name: Cazador relevo Oracle
+run-name: ${{ github.event_name == 'workflow_dispatch' && 'Vuelta de caza' || 'Vigilante' }}
+
+# Como funciona:
+# - "cazar" (Vuelta de caza) intenta crear la VM gratis de Oracle una vez por minuto y deja programada la
+#   siguiente vuelta, asi que no depende del horario de GitHub.
+# - "vigilar" (Vigilante) corre al guardar este archivo y cada 2 horas: si no hay ninguna vuelta activa, lanza una.
+# - Cuando la VM existe y esta en Tailscale, la cadena se detiene sola; el Vigilante la revisa cada 2 horas.
 
 on:
+  push:
+    branches: [main]
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '23 */2 * * *'
   workflow_dispatch:
+    inputs:
+      fallos:
+        description: 'Uso interno: dejalo en 0'
+        required: false
+        default: '0'
 
 concurrency:
-  group: cazador
+  group: cazador-${{ github.event_name }}
   cancel-in-progress: false
 
 permissions:
   contents: write
   issues: write
+  actions: write
 
 jobs:
-  cazar:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+  vigilar:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Revisar que el cazador siga activo
+        run: |
+          WF=${GITHUB_WORKFLOW_REF%%@*}
+          WF=${WF##*/}
+          [ -n "$WF" ] || WF=cazador.yml
+          vivos=$(gh run list -R "$GITHUB_REPOSITORY" --workflow "$WF" --event workflow_dispatch --limit 30 --json status --jq '[.[] | select(.status != "completed")] | length' 2>/dev/null) || vivos=""
+          case "$vivos" in
+            0)
+              if gh workflow run "$WF" -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f fallos=0; then
+                echo "No habia ninguna vuelta activa: lance una."
+              else
+                echo "No pude lanzar el cazador."
+                exit 1
+              fi ;;
+            "")
+              echo "No pude consultar las ejecuciones; esta vez no hago nada." ;;
+            *)
+              echo "El cazador ya esta activo; no hago nada." ;;
+          esac
+
+          # GitHub pausa el horario tras 60 dias sin cambios en el repositorio: se marca actividad cada 45 dias.
+          ult=$(gh api "repos/$GITHUB_REPOSITORY/commits?per_page=1" --jq '.[0].commit.committer.date' 2>/dev/null) || ult=""
+          seg=""
+          if [ -n "$ult" ]; then seg=$(date -d "$ult" +%s 2>/dev/null) || seg=""; fi
+          if [ -n "$seg" ] && [ $(( ( $(date +%s) - seg ) / 86400 )) -ge 45 ]; then
+            sha=$(gh api "repos/$GITHUB_REPOSITORY/contents/.keepalive" --jq '.sha' 2>/dev/null) || sha=""
+            args=(-X PUT "repos/$GITHUB_REPOSITORY/contents/.keepalive" -f message=keepalive -f content="$(date -u +%F | base64)")
+            if printf '%s' "$sha" | grep -qE '^[0-9a-f]{40}$'; then args+=(-f sha="$sha"); fi
+            if gh api "${args[@]}" >/dev/null 2>&1; then echo "Marque actividad en el repositorio."; fi
+          fi
+
+  cazar:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      GH_TOKEN: ${{ github.token }}
+      FALLOS: ${{ inputs.fallos || '0' }}
       OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
       NOMBRE: relay-bogota
       SUBRED: public subnet-relay-vcn
+      MINUTOS_CAZA: '50'
     steps:
-      - uses: actions/checkout@v4
-
       - name: Instalar OCI CLI
         run: |
-          pipx install oci-cli >/dev/null 2>&1
+          mkdir -p /tmp/caz
+          cat > /tmp/caz/lib.sh <<'LIB'
+          WF=${GITHUB_WORKFLOW_REF%%@*}
+          WF=${WF##*/}
+          [ -n "$WF" ] || WF=cazador.yml
+          # Estado de la cadena: pendiente = programar la siguiente vuelta ya; hecho = ya esta programada;
+          # fin = no hace falta otra; reintentar (o nada) = algo fallo, esperar y probar otra vez.
+          estado() { echo "$1" > /tmp/caz/cadena; }
+          despachar() {
+            local i
+            for i in 1 2 3; do
+              if gh workflow run "$WF" -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f fallos="$1" >/dev/null 2>/tmp/caz/gh_err; then return 0; fi
+              sleep 10
+            done
+            echo "No pude programar la siguiente vuelta: $(tail -1 /tmp/caz/gh_err 2>/dev/null || true)"
+            return 1
+          }
+          # avisar TITULO CUERPO [una-vez]: crea un aviso (issue) que llega por correo, sin repetirlo.
+          avisar() {
+            local j n f
+            j=$(gh issue list -R "$GITHUB_REPOSITORY" --state all --limit 200 --json title,state 2>/dev/null) || j='[]'
+            if [ "${3:-abierto}" = "una-vez" ]; then
+              f='[.[] | select(.title == $t)] | length'
+            else
+              f='[.[] | select(.title == $t and .state == "OPEN")] | length'
+            fi
+            n=$(printf '%s' "$j" | jq --arg t "$1" "$f" 2>/dev/null) || n=0
+            if [ "${n:-0}" = "0" ]; then
+              gh issue create -R "$GITHUB_REPOSITORY" --title "$1" --body "$2" >/dev/null 2>&1 || echo "(No pude crear el aviso en GitHub.)"
+            fi
+            return 0
+          }
+          cerrar_avisos() {
+            local j n
+            j=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --limit 200 --json title,number 2>/dev/null) || return 0
+            for n in $(printf '%s' "$j" | jq -r '.[] | select(.title | startswith("Cazador detenido")) | .number' 2>/dev/null); do
+              gh issue close "$n" -R "$GITHUB_REPOSITORY" --comment "Resuelto: el cazador volvio a funcionar." >/dev/null 2>&1 || true
+            done
+            return 0
+          }
+          LIB
+          if ! pipx install oci-cli >/tmp/caz/pipx.log 2>&1; then
+            sleep 20
+            if ! pipx install --force oci-cli >/tmp/caz/pipx.log 2>&1; then
+              echo "No se pudo instalar la herramienta de Oracle. Se reintenta en la siguiente vuelta."
+              tail -5 /tmp/caz/pipx.log
+              exit 1
+            fi
+          fi
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Credenciales de Oracle
@@ -40,6 +143,7 @@ jobs:
           SSH_PUBKEY: ${{ secrets.SSH_PUBKEY }}
         run: |
           # Este paso saca cada dato de lo que haya en los secretos, aunque venga con texto de mas.
+          . /tmp/caz/lib.sh
           mkdir -p ~/.oci
           ok=1
 
@@ -97,7 +201,11 @@ jobs:
             echo "Llave de Tailscale: NO ENCONTRADA. El secreto TS_AUTHKEY debe tener la llave completa (empieza con tskey-auth-)."
           fi
 
-          [ "$ok" = "1" ] || exit 1
+          if [ "$ok" != "1" ]; then
+            estado fin
+            avisar "Cazador detenido: faltan datos en los secretos" "El cazador no pudo leer la llave o los datos de Oracle guardados en los secretos del repositorio. Abre la ultima ejecucion en la pestana Actions, despliega el paso Credenciales de Oracle y mandale una captura a Claude."
+            exit 1
+          fi
 
           {
             echo "[DEFAULT]"
@@ -114,12 +222,16 @@ jobs:
           if [ -n "$SSH_PUBKEY" ]; then printf '%s\n' "$SSH_PUBKEY" | tr -d '\r' >> /tmp/ssh.pub; fi
 
       - name: Cazar o cuidar la VM
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
+          . /tmp/caz/lib.sh
           C=$(sed -n 's/^tenancy=//p' ~/.oci/config)
           TSKEY=$(cat ~/.oci/tskey 2>/dev/null || true)
           SSHO=(-i "$HOME/.oci/key.pem" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15)
+          SEL='[.data[]? | select(."lifecycle-state" != "TERMINATED" and ."lifecycle-state" != "TERMINATING")] | sort_by(."time-created") | .[0]'
+          CAPTURA="Abre la ultima ejecucion en la pestana Actions del repositorio y mandale una captura a Claude."
+          DESP=0
+          L=""
+          hora() { TZ=America/Bogota date +%H:%M; }
 
           explicar() {
             { cat /tmp/oci_err 2>/dev/null || true; printf '%s\n' "$1"; } > /tmp/oci_all
@@ -134,6 +246,115 @@ jobs:
             local o
             if ! o=$("$@" 2>/tmp/oci_err); then return 1; fi
             if [ -n "$o" ]; then printf '%s' "$o" | jq -r "$f"; fi
+          }
+
+          es_fatal() { grep -qE 'NotAuthenticated|NotAuthorizedOrNotFound|InvalidParameter|MissingParameter|LimitExceeded|QuotaExceeded' "$1" 2>/dev/null; }
+
+          # listar: 0 = bien (respuesta en L), 1 = fallo temporal, 2 = Oracle rechazo la llave.
+          listar() {
+            local i
+            for i in 1 2 3; do
+              if L=$(oci compute instance list -c "$C" --display-name "$NOMBRE" --all 2>/tmp/oci_err); then return 0; fi
+              if es_fatal /tmp/oci_err; then return 2; fi
+              sleep 20
+            done
+            return 1
+          }
+
+          # vm_campo CAMPO: dato de la VM viva mas antigua con ese nombre (vacio si no hay).
+          vm_campo() {
+            if [ -z "$L" ]; then return 0; fi
+            printf '%s' "$L" | jq -r "$SEL | .\"$1\" // empty"
+          }
+
+          # esperar_running ID: 0 = encendida, 1 = aun no, 2 = Oracle la elimino.
+          esperar_running() {
+            local i s
+            for i in $(seq 1 24); do
+              s=$(consultar '.data."lifecycle-state" // empty' oci compute instance get --instance-id "$1" || true)
+              if [ "$s" = "RUNNING" ]; then return 0; fi
+              case "$s" in TERMINATED|TERMINATING) return 2 ;; esac
+              sleep 15
+            done
+            return 1
+          }
+
+          # revisar_ts ID: 0 = relevo listo, 1 = aun no se pudo comprobar, 2 = no entro a Tailscale.
+          revisar_ts() {
+            local ip r o i
+            ip=$(consultar '.data[0]."public-ip" // empty' oci compute instance list-vnics --instance-id "$1" || true)
+            if [ -z "$ip" ] || [ "$ip" = "null" ]; then echo "La VM todavia no tiene direccion publica."; return 1; fi
+            r=""
+            for i in $(seq 1 12); do
+              r=$(timeout 60 ssh "${SSHO[@]}" "ubuntu@$ip" 'if sudo tailscale status >/dev/null 2>&1; then sudo tailscale set --relay-server-port=40000 >/dev/null 2>&1; echo TS_OK; else echo TS_NO; fi' 2>/dev/null || true)
+              case "$r" in *TS_OK*|*TS_NO*) break ;; esac
+              sleep 30
+            done
+            case "$r" in
+              *TS_OK*)
+                echo "Tailscale en la VM: conectado. El relevo esta listo."
+                return 0 ;;
+              *TS_NO*)
+                echo "Tailscale en la VM: aun no conectado. Lo configuro (puede tardar varios minutos)..."
+                if [ -z "$TSKEY" ]; then echo "Falta la llave de Tailscale (secreto TS_AUTHKEY)."; return 2; fi
+                o=$(timeout 1500 ssh "${SSHO[@]}" "ubuntu@$ip" 'umask 077; cat > /tmp/relay-setup.sh && sudo bash /tmp/relay-setup.sh; rm -f /tmp/relay-setup.sh' < /tmp/init.sh 2>&1 || true)
+                if printf '%s' "$o" | grep -q RELAY_OK; then
+                  echo "Listo: la VM ya esta en Tailscale como relevo."
+                  return 0
+                fi
+                echo "No se pudo conectar la VM a Tailscale:"
+                printf '%s\n' "$o" | sed -E 's/tskey-[A-Za-z0-9-]+/tskey-***/g' | tail -6
+                if printf '%s' "$o" | grep -q RELAY_FALLO; then return 2; fi
+                return 1 ;;
+              *)
+                echo "Todavia no pude entrar a la VM (puede estar arrancando)."
+                return 1 ;;
+            esac
+          }
+
+          # cuidar ID ESTADO: 0 = relevo listo, 1 = aun no se sabe, 2 = no entro a Tailscale, 3 = Oracle la elimino.
+          cuidar() {
+            local id="$1" est="$2" r
+            if [ "$est" = "STOPPED" ]; then
+              if oci compute instance action --instance-id "$id" --action START >/dev/null 2>/tmp/oci_err; then
+                echo "Estaba apagada: la encendi."
+              else
+                echo "Estaba apagada y no pude encenderla:"
+                explicar ""
+                return 1
+              fi
+            fi
+            if [ "$est" != "RUNNING" ]; then
+              r=0; esperar_running "$id" || r=$?
+              if [ "$r" = "2" ]; then return 3; fi
+              if [ "$r" != "0" ]; then echo "La VM todavia no termina de encender."; return 1; fi
+              sleep 30
+            fi
+            r=0; revisar_ts "$id" || r=$?
+            return "$r"
+          }
+
+          # cerrar_vuelta RESULTADO: avisa lo que corresponda y termina esta vuelta.
+          cerrar_vuelta() {
+            case "$1" in
+              0)
+                estado fin
+                avisar "VM relay-bogota creada y conectada a Tailscale" "El cazador consiguio la VM gratis en Oracle Bogota y ya aparece en Tailscale como relay-bogota. Avisale a Claude para hacer la prueba de las camaras." una-vez
+                cerrar_avisos
+                exit 0 ;;
+              2)
+                estado fin
+                avisar "Cazador detenido: la VM existe pero no entro a Tailscale" "La VM relay-bogota ya esta creada en Oracle, pero no se pudo conectar a Tailscale. Lo mas probable es que la llave de Tailscale ya se haya usado o este vencida: genera otra en Tailscale con la etiqueta tag:relay, actualiza el secreto TS_AUTHKEY y toca Run workflow. Si no se arregla, $CAPTURA"
+                exit 1 ;;
+              3)
+                echo "Oracle elimino la VM antes de que encendiera. Sigo intentando en la siguiente vuelta."
+                if [ "$DESP" != "1" ]; then estado pendiente; fi
+                exit 0 ;;
+              *)
+                echo "Aun no pude comprobarla. La reviso otra vez en la siguiente vuelta."
+                if [ "$DESP" != "1" ]; then estado reintentar; fi
+                exit 1 ;;
+            esac
           }
 
           # Lo que la VM ejecuta para quedar como relevo de Tailscale. Se puede repetir sin danar nada.
@@ -166,100 +387,177 @@ jobs:
           sed -i "s|__TSKEY__|$TSKEY|" /tmp/init.sh
 
           # 1) Si la VM ya existe, solo la cuida: la enciende si Oracle la apago y revisa Tailscale.
-          if ! L=$(oci compute instance list -c "$C" --display-name "$NOMBRE" --all 2>/tmp/oci_err); then
-            echo "No pude consultar Oracle:"
-            explicar "$L"
+          rc=0; listar || rc=$?
+          if [ "$rc" = "2" ]; then
+            echo "Oracle rechazo la llave o el usuario:"
+            explicar ""
+            estado fin
+            avisar "Cazador detenido: Oracle rechazo la llave" "Oracle ya no acepta la llave guardada en los secretos del repositorio (OCI_KEY y OCI_CONFIG). $CAPTURA"
+            exit 1
+          elif [ "$rc" != "0" ]; then
+            echo "No pude consultar Oracle (parece un fallo temporal):"
+            explicar ""
+            estado reintentar
             exit 1
           fi
-          EST=""
-          ID=""
-          if [ -n "$L" ]; then
-            SEL='[.data[]? | select(."lifecycle-state" != "TERMINATED" and ."lifecycle-state" != "TERMINATING")][0]'
-            EST=$(printf '%s' "$L" | jq -r "$SEL.\"lifecycle-state\" // empty") \
-              || { echo "Oracle respondio algo inesperado; no intento crear nada."; exit 1; }
-            ID=$(printf '%s' "$L" | jq -r "$SEL.id // empty")
-          fi
+          EST=$(vm_campo lifecycle-state) || { echo "Oracle respondio algo inesperado; no intento crear nada."; estado reintentar; exit 1; }
+          ID=$(vm_campo id) || ID=""
           if [ -n "$EST" ]; then
             echo "La VM ya existe (estado: $EST)."
-            if [ "$EST" = "STOPPED" ]; then
-              oci compute instance action --instance-id "$ID" --action START >/dev/null && echo "Estaba apagada: la encendi."
-            fi
-            if [ "$EST" = "RUNNING" ]; then
-              IP=$(consultar '.data[0]."public-ip" // empty' oci compute instance list-vnics --instance-id "$ID" || true)
-              R=""
-              if [ -n "$IP" ] && [ "$IP" != "null" ]; then
-                R=$(timeout 60 ssh "${SSHO[@]}" "ubuntu@$IP" 'if sudo tailscale status >/dev/null 2>&1; then echo TS_OK; else echo TS_NO; fi' 2>/dev/null || true)
-              fi
-              case "$R" in
-                *TS_OK*)
-                  echo "Tailscale en la VM: conectado. El relevo esta listo." ;;
-                *TS_NO*)
-                  echo "Tailscale en la VM: aun no conectado. Lo configuro..."
-                  if [ -z "$TSKEY" ]; then echo "Falta la llave de Tailscale (secreto TS_AUTHKEY)."; exit 1; fi
-                  O=$(timeout 900 ssh "${SSHO[@]}" "ubuntu@$IP" 'umask 077; cat > /tmp/relay-setup.sh && sudo bash /tmp/relay-setup.sh; rm -f /tmp/relay-setup.sh' < /tmp/init.sh 2>&1 || true)
-                  if printf '%s' "$O" | grep -q RELAY_OK; then
-                    echo "Listo: la VM ya esta en Tailscale como relevo."
-                  else
-                    echo "No se pudo conectar la VM a Tailscale:"
-                    printf '%s\n' "$O" | sed -E 's/tskey-[A-Za-z0-9-]+/tskey-***/g' | tail -6
-                    exit 1
-                  fi ;;
-                *)
-                  echo "Aviso: todavia no pude entrar a la VM (puede estar arrancando). Reintento en la proxima vuelta." ;;
-              esac
-            fi
-            exit 0
+            r=0; cuidar "$ID" "$EST" || r=$?
+            cerrar_vuelta "$r"
           fi
-          if [ -z "$TSKEY" ]; then echo "Falta la llave de Tailscale (secreto TS_AUTHKEY)."; exit 1; fi
+
+          if [ -z "$TSKEY" ]; then
+            echo "Falta la llave de Tailscale (secreto TS_AUTHKEY)."
+            estado fin
+            avisar "Cazador detenido: falta la llave de Tailscale" "El secreto TS_AUTHKEY no tiene una llave valida de Tailscale (empieza con tskey-auth-). Genera una en Tailscale con la etiqueta tag:relay, guardala en ese secreto y toca Run workflow."
+            exit 1
+          fi
 
           # 2) Datos para crearla.
-          AD=$(consultar '.data[0].name // empty' oci iam availability-domain list -c "$C") || { echo "No pude leer los datos de Oracle:"; explicar ""; exit 1; }
-          SUB=$(consultar '.data[0].id // empty' oci network subnet list -c "$C" --display-name "$SUBRED") || { echo "No pude leer la red:"; explicar ""; exit 1; }
-          IMG=$(consultar '[.data[]? | select((."display-name" | test("Ubuntu")) and (."display-name" | test("24\\.04")) and (."display-name" | test("Minimal") | not))][0].id // empty' oci compute image list -c "$C" --all --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC) || { echo "No pude leer las imagenes:"; explicar ""; exit 1; }
+          datos() {
+            AD=$(consultar '.data[0].name // empty' oci iam availability-domain list -c "$C") || return 1
+            SUB=$(consultar '.data[0].id // empty' oci network subnet list -c "$C" --display-name "$SUBRED") || return 1
+            IMG=$(consultar '[.data[]? | select((."display-name" | test("Ubuntu")) and (."display-name" | test("24\\.04")) and (."display-name" | test("Minimal") | not))][0].id // empty' oci compute image list -c "$C" --all --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC) || return 1
+          }
+          listo=0
+          for i in 1 2 3; do
+            if datos; then listo=1; break; fi
+            if es_fatal /tmp/oci_err; then break; fi
+            sleep 20
+          done
+          if [ "$listo" != "1" ]; then
+            echo "No pude leer los datos de Oracle:"
+            explicar ""
+            if es_fatal /tmp/oci_err; then
+              estado fin
+              avisar "Cazador detenido: Oracle rechazo la peticion" "Oracle rechazo una consulta del cazador. $CAPTURA"
+            else
+              estado reintentar
+            fi
+            exit 1
+          fi
           for v in AD SUB IMG; do
-            if [ -z "${!v}" ] || [ "${!v}" = "null" ]; then echo "No encontre $v"; exit 1; fi
+            if [ -z "${!v}" ] || [ "${!v}" = "null" ]; then
+              echo "No encontre $v en Oracle (la red relay-vcn o la imagen de Ubuntu)."
+              estado fin
+              avisar "Cazador detenido: falta la red o la imagen en Oracle" "El cazador no encontro en Oracle la red relay-vcn o la imagen de Ubuntu que necesita. $CAPTURA"
+              exit 1
+            fi
           done
 
           EXTRA=()
           if [ -s /tmp/ssh.pub ]; then EXTRA=(--ssh-authorized-keys-file /tmp/ssh.pub); fi
 
-          # 3) Intentos cada 60 s durante ~3 minutos (el flujo se repite cada 5 minutos).
-          FIN=$(( $(date +%s) + 180 ))
+          # 3) Un intento por minuto. Tras el primer "sin cupo" deja programada la siguiente vuelta.
+          MIN=${MINUTOS_CAZA:-50}
+          FIN=$(( $(date +%s) + MIN * 60 ))
           n=0
+          raros=0
+          dfallos=0
+          estado pendiente
+          echo "Todavia no hay VM. Intento crearla cada minuto durante $MIN minutos (hora de Colombia)."
           while :; do
             n=$((n+1))
+            espera=60
             R=$(oci --no-retry compute instance launch -c "$C" --availability-domain "$AD" \
                 --shape VM.Standard.A1.Flex --shape-config '{"ocpus":1,"memoryInGBs":1}' \
                 --image-id "$IMG" --subnet-id "$SUB" --assign-public-ip true \
                 --display-name "$NOMBRE" --hostname-label relay-bogota \
-                --user-data-file /tmp/init.sh "${EXTRA[@]}" 2>&1) || true
-            if printf '%s' "$R" | grep -q '"lifecycle-state"'; then
-              echo "VM creada en el intento $n."
-              gh issue create --title "VM relay-bogota creada" \
-                --body "El cazador consiguio la VM en Oracle Bogota. En unos minutos aparece sola en Tailscale como relay-bogota." >/dev/null || true
-              exit 0
-            elif printf '%s' "$R" | grep -qiE 'capacity|TooManyRequests|InternalError|timed out|timeout|Connection|ServiceUnavailable|Bad Gateway'; then
-              echo "Intento $n: sin cupo."
-            else
-              echo "Error inesperado:"
-              : > /tmp/oci_err
-              explicar "$R"
-              exit 1
+                --user-data-file /tmp/init.sh "${EXTRA[@]}" 2>/tmp/launch_err) || true
+            NID=$(printf '%s' "$R" | jq -r '.data.id // empty' 2>/dev/null || true)
+            if [ -z "$NID" ]; then
+              { cat /tmp/launch_err 2>/dev/null || true; printf '%s\n' "$R"; } > /tmp/launch_all
+              if grep -qiE 'capacity|"code": "InternalError"' /tmp/launch_all; then
+                raros=0
+                echo "$(hora) intento $n: sin cupo."
+                if [ "$DESP" != "1" ] && [ "$dfallos" -lt 3 ]; then
+                  if despachar 0; then DESP=1; estado hecho; else dfallos=$((dfallos+1)); fi
+                fi
+                if [ "$n" = "1" ]; then
+                  avisar "Cazador en marcha" "El cazador ya esta intentando crear la VM gratis de Oracle en Bogota, un intento por minuto, sin depender de tu computador. Cuando lo logre te llega otro aviso: VM relay-bogota creada y conectada a Tailscale." una-vez
+                  cerrar_avisos
+                fi
+              elif grep -qE 'TooManyRequests|"status": 429' /tmp/launch_all; then
+                echo "$(hora) intento $n: Oracle pide ir mas despacio. Espero 5 minutos."
+                espera=300
+              elif es_fatal /tmp/launch_all; then
+                echo "$(hora) intento $n: Oracle rechazo la peticion:"
+                grep -E '"code"|"message"' /tmp/launch_all || tail -5 /tmp/launch_all
+                estado fin
+                avisar "Cazador detenido: Oracle rechazo la peticion" "Oracle rechazo el intento de crear la VM (no es falta de cupo). $CAPTURA"
+                exit 1
+              else
+                raros=$((raros+1))
+                echo "$(hora) intento $n: respuesta inesperada de Oracle ($raros seguidas):"
+                grep -E '"code"|"message"' /tmp/launch_all || tail -3 /tmp/launch_all
+                rc=0; listar || rc=$?
+                if [ "$rc" = "0" ]; then NID=$(vm_campo id) || NID=""; fi
+                if [ -z "$NID" ] && [ "$raros" -ge 5 ]; then
+                  echo "Demasiadas respuestas inesperadas seguidas. Lo intento de nuevo en la siguiente vuelta."
+                  if [ "$DESP" != "1" ]; then estado reintentar; fi
+                  exit 1
+                fi
+              fi
             fi
-            [ "$(date +%s)" -ge "$FIN" ] && break
-            sleep 60
+            if [ -n "$NID" ]; then
+              echo "$(hora) intento $n: VM CREADA. Espero a que encienda y se conecte a Tailscale (puede tardar varios minutos)..."
+              if [ "$DESP" != "1" ]; then estado reintentar; fi
+              sleep 45
+              r=0; cuidar "$NID" PROVISIONING || r=$?
+              cerrar_vuelta "$r"
+            fi
+            if [ "$(date +%s)" -ge "$FIN" ]; then break; fi
+            sleep "$espera"
           done
+          echo "Esta vuelta termino sin cupo. La siguiente continua enseguida."
 
-      - name: Mantener activo el repositorio
-        if: always()
-        continue-on-error: true
+      - name: Siguiente vuelta
+        if: ${{ !cancelled() }}
         run: |
-          dias=$(( ( $(date +%s) - $(git log -1 --format=%ct) ) / 86400 ))
-          if [ "$dias" -ge 45 ]; then
-            date -u +%F > .keepalive
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add .keepalive
-            git commit -q -m "keepalive"
-            git push -q
-          fi
+          E=$(cat /tmp/caz/cadena 2>/dev/null || echo reintentar)
+          WF=${GITHUB_WORKFLOW_REF%%@*}
+          WF=${WF##*/}
+          [ -n "$WF" ] || WF=cazador.yml
+          F=${FALLOS:-0}
+          case "$F" in ''|*[!0-9]*) F=0 ;; esac
+          lanzar() {
+            local i
+            for i in 1 2 3; do
+              if gh workflow run "$WF" -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f fallos="$1" >/dev/null 2>&1; then
+                echo "Siguiente vuelta programada."
+                return 0
+              fi
+              sleep 10
+            done
+            echo "No pude programar la siguiente vuelta."
+            aviso_final "Cazador detenido: no pude programar la siguiente vuelta" "GitHub no dejo programar la siguiente vuelta del cazador, asi que quedo detenido. Abre la pestana Actions del repositorio, entra a Cazador relevo Oracle y toca Run workflow para reanudarlo. Si vuelve a pasar, mandale a Claude una captura de la ultima ejecucion."
+            return 1
+          }
+          aviso_final() {
+            if [ -f /tmp/caz/lib.sh ]; then
+              . /tmp/caz/lib.sh
+              avisar "$1" "$2"
+            fi
+          }
+          case "$E" in
+            hecho)
+              echo "La siguiente vuelta ya esta programada." ;;
+            fin)
+              echo "No hace falta otra vuelta por ahora." ;;
+            pendiente)
+              lanzar 0 || exit 1 ;;
+            *)
+              F=$((F+1))
+              if [ "$F" -ge 10 ]; then
+                echo "Van $F vueltas seguidas con problemas: me detengo y aviso."
+                aviso_final "Cazador detenido: varias vueltas seguidas con problemas" "El cazador fallo $F veces seguidas y se detuvo para no insistir a ciegas. Abre la pestana Actions del repositorio, entra a Cazador relevo Oracle y toca Run workflow para reanudarlo. Si vuelve a detenerse, mandale a Claude una captura de la ultima ejecucion."
+              else
+                M=$(( F * 5 ))
+                if [ "$M" -gt 20 ]; then M=20; fi
+                echo "Esta vuelta no termino bien (van $F seguidas). Espero $M minutos y lo intento otra vez."
+                sleep $(( M * 60 ))
+                lanzar "$F" || exit 1
+              fi ;;
+          esac
