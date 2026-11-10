@@ -16,7 +16,7 @@ permissions:
 jobs:
   cazar:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 20
     env:
       OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
       NOMBRE: relay-bogota
@@ -31,83 +31,199 @@ jobs:
 
       - name: Credenciales de Oracle
         env:
+          OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
           OCI_USER: ${{ secrets.OCI_USER }}
           OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
           OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
           OCI_KEY: ${{ secrets.OCI_KEY }}
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+          SSH_PUBKEY: ${{ secrets.SSH_PUBKEY }}
         run: |
-          for v in OCI_USER OCI_TENANCY OCI_FINGERPRINT OCI_KEY; do
-            [ -n "${!v}" ] || { echo "Falta el secreto $v"; exit 1; }
-          done
+          # Este paso saca cada dato de lo que haya en los secretos, aunque venga con texto de mas.
           mkdir -p ~/.oci
-          printf '%s\n' "$OCI_KEY" | tr -d '\r' | sed -n '/-----BEGIN/,/-----END/p' > ~/.oci/key.pem
-          chmod 600 ~/.oci/key.pem
+          ok=1
+
+          # 1) Llave privada: acepta el .pem completo o solo las letras.
+          K=$(printf '%s\n' "$OCI_KEY" | tr -d '\r')
+          B64=$(printf '%s\n' "$K" | sed -e 's/-----[A-Z ]*-----//g' -e 's/OCI_API_KEY//g' | tr -cd 'A-Za-z0-9+/=')
+          escribir_llave() {
+            { echo "-----BEGIN $1-----"; printf '%s\n' "$B64" | fold -w 64; echo "-----END $1-----"; } > ~/.oci/key.pem
+            chmod 600 ~/.oci/key.pem
+            openssl pkey -in ~/.oci/key.pem -noout 2>/dev/null
+          }
+          FP=""
+          if [ -n "$B64" ] && { escribir_llave "PRIVATE KEY" || escribir_llave "RSA PRIVATE KEY"; }; then
+            echo "Llave privada (OCI_KEY): OK"
+            # El fingerprint se calcula de la propia llave, asi no hay que copiarlo.
+            FP=$(openssl pkey -in ~/.oci/key.pem -pubout -outform DER 2>/dev/null | openssl md5 -c 2>/dev/null | awk '{print $NF}' || true)
+          else
+            echo "Llave privada (OCI_KEY): NO VALIDA. Abre el .pem de la API key con el Bloc de notas, Ctrl+A, Ctrl+C, y pegalo completo en el secreto OCI_KEY."
+            ok=0
+          fi
+          FPS=$(printf '%s\n%s\n' "$OCI_CONFIG" "$OCI_FINGERPRINT" | grep -oE '([0-9a-f]{2}:){15}[0-9a-f]{2}' | head -1 || true)
+          if [ -n "$FP" ] && [ -n "$FPS" ] && [ "$FP" != "$FPS" ]; then
+            echo "Aviso: el fingerprint guardado no coincide con esta llave. Si Oracle la rechaza, el .pem pegado no es el de la API key."
+          fi
+
+          # 2) OCID de usuario y de tenancy: los busca en todos los secretos.
+          TODO=$(printf '%s\n%s\n%s\n' "$OCI_CONFIG" "$OCI_USER" "$OCI_TENANCY" | tr -d '\r')
+          U=$(printf '%s\n' "$TODO" | grep -oE 'ocid1\.user\.oc1\.\.[a-z0-9]{60}' | head -1 || true)
+          T=$(printf '%s\n' "$TODO" | grep -oE 'ocid1\.tenancy\.oc1\.\.[a-z0-9]{60}' | head -1 || true)
+          if [ -z "$U" ]; then
+            b=$(printf '%s' "$OCI_USER" | tr -d '[:space:]')
+            if printf '%s' "$b" | grep -qE '^[a-z0-9]{60}$'; then U="ocid1.user.oc1..$b"; fi
+          fi
+          if [ -z "$T" ]; then
+            b=$(printf '%s' "$OCI_TENANCY" | tr -d '[:space:]')
+            if printf '%s' "$b" | grep -qE '^[a-z0-9]{60}$'; then T="ocid1.tenancy.oc1..$b"; fi
+          fi
+          AYUDA="Crea el secreto OCI_CONFIG y pega ahi TODO el texto del Bloc de notas donde guardaste el 'Configuration file preview' de Oracle."
+          if [ -n "$U" ]; then echo "Usuario de Oracle: OK"; else echo "Usuario de Oracle: NO ENCONTRADO. $AYUDA"; ok=0; fi
+          if [ -n "$T" ]; then echo "Tenancy de Oracle: OK"; else echo "Tenancy de Oracle: NO ENCONTRADO. $AYUDA"; ok=0; fi
+
+          # 3) Llave de Tailscale: toma la mas completa que encuentre.
+          TSKEY=$(printf '%s\n%s\n' "$TS_AUTHKEY" "$OCI_CONFIG" | tr -d '\r' | grep -oE 'tskey-auth-[A-Za-z0-9]+-[A-Za-z0-9]+' | awk '{ if (length($0) > length(m)) m = $0 } END { print m }' || true)
+          if [ -n "$TSKEY" ]; then
+            echo "::add-mask::$TSKEY"
+            printf '%s' "$TSKEY" > ~/.oci/tskey
+            chmod 600 ~/.oci/tskey
+            FIN_TS=${TSKEY##*-}
+            if [ "${#FIN_TS}" -lt 30 ]; then
+              echo "Llave de Tailscale: parece INCOMPLETA. Si la VM no aparece en Tailscale, genera otra y actualiza TS_AUTHKEY."
+            else
+              echo "Llave de Tailscale: OK"
+            fi
+          else
+            echo "Llave de Tailscale: NO ENCONTRADA. El secreto TS_AUTHKEY debe tener la llave completa (empieza con tskey-auth-)."
+          fi
+
+          [ "$ok" = "1" ] || exit 1
+
           {
             echo "[DEFAULT]"
-            echo "user=$(printf '%s' "$OCI_USER" | tr -d '[:space:]')"
-            echo "fingerprint=$(printf '%s' "$OCI_FINGERPRINT" | tr -d '[:space:]')"
-            echo "tenancy=$(printf '%s' "$OCI_TENANCY" | tr -d '[:space:]')"
+            echo "user=$U"
+            echo "fingerprint=$FP"
+            echo "tenancy=$T"
             echo "region=sa-bogota-1"
             echo "key_file=$HOME/.oci/key.pem"
           } > ~/.oci/config
           chmod 600 ~/.oci/config
 
+          # 4) Acceso de emergencia a la VM: la misma llave sirve para entrar por SSH.
+          ssh-keygen -y -f ~/.oci/key.pem > /tmp/ssh.pub 2>/dev/null || true
+          if [ -n "$SSH_PUBKEY" ]; then printf '%s\n' "$SSH_PUBKEY" | tr -d '\r' >> /tmp/ssh.pub; fi
+
       - name: Cazar o cuidar la VM
         env:
-          C_RAW: ${{ secrets.OCI_TENANCY }}
-          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
-          SSH_PUBKEY: ${{ secrets.SSH_PUBKEY }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          C=$(printf '%s' "$C_RAW" | tr -d '[:space:]')
+          C=$(sed -n 's/^tenancy=//p' ~/.oci/config)
+          TSKEY=$(cat ~/.oci/tskey 2>/dev/null || true)
+          SSHO=(-i "$HOME/.oci/key.pem" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15)
 
-          # 1) Si la VM ya existe, solo la cuida (la enciende si Oracle la apago).
+          explicar() {
+            { cat /tmp/oci_err 2>/dev/null || true; printf '%s\n' "$1"; } > /tmp/oci_all
+            grep -E '"code"|"message"' /tmp/oci_all || tail -15 /tmp/oci_all
+            if grep -q 'NotAuthenticated' /tmp/oci_all; then
+              echo "Pista: Oracle no reconoce esta llave para ese usuario. Revisa que OCI_KEY sea el .pem de la API key y que OCI_CONFIG tenga el 'Configuration file preview' de esa misma llave."
+            fi
+          }
+
+          consultar() {
+            local f="$1"; shift
+            local o
+            if ! o=$("$@" 2>/tmp/oci_err); then return 1; fi
+            if [ -n "$o" ]; then printf '%s' "$o" | jq -r "$f"; fi
+          }
+
+          # Lo que la VM ejecuta para quedar como relevo de Tailscale. Se puede repetir sin danar nada.
+          cat > /tmp/init.sh <<'INIT'
+          #!/bin/bash
+          KEY='__TSKEY__'
+          exec 9>/run/relay-setup.lock
+          flock -w 900 9 || exit 0
+          if [ ! -f /swapfile ]; then
+            fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile && echo '/swapfile none swap sw 0 0' >> /etc/fstab
+          fi
+          iptables -C INPUT -p udp --dport 40000 -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport 40000 -j ACCEPT
+          netfilter-persistent save >/dev/null 2>&1 || true
+          for i in $(seq 1 20); do
+            command -v tailscale >/dev/null 2>&1 && break
+            curl -fsSL https://tailscale.com/install.sh | sh >/dev/null 2>&1
+            command -v tailscale >/dev/null 2>&1 && break
+            sleep 30
+          done
+          systemctl enable --now tailscaled >/dev/null 2>&1 || true
+          for i in 1 2 3 4; do
+            tailscale status >/dev/null 2>&1 && break
+            tailscale up --timeout=60s --auth-key="$KEY" --advertise-tags=tag:relay --hostname=relay-bogota --accept-dns=false && break
+            tailscale up --timeout=60s --reset --auth-key="$KEY" --hostname=relay-bogota --accept-dns=false && break
+            sleep 15
+          done
+          tailscale set --relay-server-port=40000
+          if tailscale status >/dev/null 2>&1; then echo RELAY_OK; else echo RELAY_FALLO; fi
+          INIT
+          sed -i "s|__TSKEY__|$TSKEY|" /tmp/init.sh
+
+          # 1) Si la VM ya existe, solo la cuida: la enciende si Oracle la apago y revisa Tailscale.
           if ! L=$(oci compute instance list -c "$C" --display-name "$NOMBRE" --all 2>/tmp/oci_err); then
             echo "No pude consultar Oracle:"
-            { cat /tmp/oci_err; printf '%s\n' "$L"; } | grep -E '"code"|"message"' \
-              || { cat /tmp/oci_err; printf '%s\n' "$L"; } | tail -3
+            explicar "$L"
             exit 1
           fi
           EST=""
+          ID=""
           if [ -n "$L" ]; then
-            EST=$(printf '%s' "$L" | jq -r '[.data[]? | select(."lifecycle-state" != "TERMINATED")][0]."lifecycle-state" // empty') \
+            SEL='[.data[]? | select(."lifecycle-state" != "TERMINATED" and ."lifecycle-state" != "TERMINATING")][0]'
+            EST=$(printf '%s' "$L" | jq -r "$SEL.\"lifecycle-state\" // empty") \
               || { echo "Oracle respondio algo inesperado; no intento crear nada."; exit 1; }
+            ID=$(printf '%s' "$L" | jq -r "$SEL.id // empty")
           fi
           if [ -n "$EST" ]; then
             echo "La VM ya existe (estado: $EST)."
             if [ "$EST" = "STOPPED" ]; then
-              ID=$(printf '%s' "$L" | jq -r '[.data[] | select(."lifecycle-state" == "STOPPED")][0].id')
               oci compute instance action --instance-id "$ID" --action START >/dev/null && echo "Estaba apagada: la encendi."
+            fi
+            if [ "$EST" = "RUNNING" ]; then
+              IP=$(consultar '.data[0]."public-ip" // empty' oci compute instance list-vnics --instance-id "$ID" || true)
+              R=""
+              if [ -n "$IP" ] && [ "$IP" != "null" ]; then
+                R=$(timeout 60 ssh "${SSHO[@]}" "ubuntu@$IP" 'if sudo tailscale status >/dev/null 2>&1; then echo TS_OK; else echo TS_NO; fi' 2>/dev/null || true)
+              fi
+              case "$R" in
+                *TS_OK*)
+                  echo "Tailscale en la VM: conectado. El relevo esta listo." ;;
+                *TS_NO*)
+                  echo "Tailscale en la VM: aun no conectado. Lo configuro..."
+                  if [ -z "$TSKEY" ]; then echo "Falta la llave de Tailscale (secreto TS_AUTHKEY)."; exit 1; fi
+                  O=$(timeout 900 ssh "${SSHO[@]}" "ubuntu@$IP" 'umask 077; cat > /tmp/relay-setup.sh && sudo bash /tmp/relay-setup.sh; rm -f /tmp/relay-setup.sh' < /tmp/init.sh 2>&1 || true)
+                  if printf '%s' "$O" | grep -q RELAY_OK; then
+                    echo "Listo: la VM ya esta en Tailscale como relevo."
+                  else
+                    echo "No se pudo conectar la VM a Tailscale:"
+                    printf '%s\n' "$O" | sed -E 's/tskey-[A-Za-z0-9-]+/tskey-***/g' | tail -6
+                    exit 1
+                  fi ;;
+                *)
+                  echo "Aviso: todavia no pude entrar a la VM (puede estar arrancando). Reintento en la proxima vuelta." ;;
+              esac
             fi
             exit 0
           fi
-          [ -n "$TS_AUTHKEY" ] || { echo "Falta el secreto TS_AUTHKEY"; exit 1; }
+          if [ -z "$TSKEY" ]; then echo "Falta la llave de Tailscale (secreto TS_AUTHKEY)."; exit 1; fi
 
           # 2) Datos para crearla.
-          AD=$(oci iam availability-domain list -c "$C" --query 'data[0].name' --raw-output)
-          SUB=$(oci network subnet list -c "$C" --display-name "$SUBRED" --query 'data[0].id' --raw-output)
-          IMG=$(oci compute image list -c "$C" --all --operating-system "Canonical Ubuntu" --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC --query 'data[?contains("display-name",`"24.04"`) && !contains("display-name",`"Minimal"`)] | [0].id' --raw-output)
+          AD=$(consultar '.data[0].name // empty' oci iam availability-domain list -c "$C") || { echo "No pude leer los datos de Oracle:"; explicar ""; exit 1; }
+          SUB=$(consultar '.data[0].id // empty' oci network subnet list -c "$C" --display-name "$SUBRED") || { echo "No pude leer la red:"; explicar ""; exit 1; }
+          IMG=$(consultar '[.data[]? | select((."display-name" | test("Ubuntu")) and (."display-name" | test("24\\.04")) and (."display-name" | test("Minimal") | not))][0].id // empty' oci compute image list -c "$C" --all --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC) || { echo "No pude leer las imagenes:"; explicar ""; exit 1; }
           for v in AD SUB IMG; do
             if [ -z "${!v}" ] || [ "${!v}" = "null" ]; then echo "No encontre $v"; exit 1; fi
           done
 
-          # 3) Lo que la VM hace sola al primer arranque: abrir el puerto, instalar Tailscale y ser relevo.
-          cat > /tmp/init.sh <<EOF
-          #!/bin/bash
-          iptables -I INPUT -p udp --dport 40000 -j ACCEPT
-          netfilter-persistent save || true
-          for i in 1 2 3 4 5 6; do curl -fsSL https://tailscale.com/install.sh | sh && break; sleep 30; done
-          for i in 1 2 3 4 5 6; do tailscale up --auth-key=$TS_AUTHKEY --hostname=relay-bogota --accept-dns=false --ssh && break; sleep 20; done
-          tailscale set --relay-server-port=40000
-          EOF
-
           EXTRA=()
-          if [ -n "$SSH_PUBKEY" ]; then
-            printf '%s\n' "$SSH_PUBKEY" | tr -d '\r' > /tmp/ssh.pub
-            EXTRA=(--ssh-authorized-keys-file /tmp/ssh.pub)
-          fi
+          if [ -s /tmp/ssh.pub ]; then EXTRA=(--ssh-authorized-keys-file /tmp/ssh.pub); fi
 
-          # 4) Intentos cada 60 s durante ~3 minutos (el flujo se repite cada 5 minutos).
+          # 3) Intentos cada 60 s durante ~3 minutos (el flujo se repite cada 5 minutos).
           FIN=$(( $(date +%s) + 180 ))
           n=0
           while :; do
@@ -126,7 +242,8 @@ jobs:
               echo "Intento $n: sin cupo."
             else
               echo "Error inesperado:"
-              printf '%s\n' "$R" | grep -E '"code"|"message"' || printf '%s\n' "$R" | tail -3
+              : > /tmp/oci_err
+              explicar "$R"
               exit 1
             fi
             [ "$(date +%s)" -ge "$FIN" ] && break
